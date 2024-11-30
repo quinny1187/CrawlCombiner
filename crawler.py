@@ -13,7 +13,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from asyncio import Lock
 from sentence_transformers import SentenceTransformer
 from datetime import datetime
-from pydantic import BaseSettings, validator
+from pydantic_settings import BaseSettings
+from pydantic.fields import Field
+from pydantic import field_validator
 import signal
 import psutil
 
@@ -31,6 +33,76 @@ class CrawlerMetrics:
     total_processing_time: float = 0.0
     errors: int = 0
     successful_requests: int = 0
+
+class CrawlerConfig(BaseSettings):
+    max_concurrent: int = 5
+    max_depth: int = 3
+    min_relevance_score: float = 0.5
+    requests_per_second: float = 2.0
+    openai_api_key: str
+    
+    class Config:
+        env_file = '.env'
+
+    @field_validator('requests_per_second')
+    def validate_rate_limit(cls, v):
+        if v <= 0 or v > 10:
+            raise ValueError('requests_per_second must be between 0 and 10')
+        return v
+
+    @field_validator('min_relevance_score')
+    def validate_relevance_score(cls, v):
+        if v < 0 or v > 1:
+            raise ValueError('min_relevance_score must be between 0 and 1')
+        return v
+
+class OpenRouterRateLimiter:
+    def __init__(self):
+        self.last_check = 0
+        self.requests_limit = 20  # Default to free tier limit
+        self.interval = 60  # Default to 60 seconds
+        self.requests_made = 0
+        self.last_reset = time.time()
+        self.lock = Lock()
+
+    async def check_api_status(self, api_key: str) -> None:
+        current_time = time.time()
+        if current_time - self.last_check < 60:  # Only check every minute
+            return
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                'https://openrouter.ai/api/v1/auth/key',
+                headers={'Authorization': f'Bearer {api_key}'}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    rate_limit = data.get('data', {}).get('rate_limit', {})
+                    self.requests_limit = rate_limit.get('requests', 20)
+                    interval_str = rate_limit.get('interval', '60s')
+                    self.interval = int(interval_str.rstrip('s'))
+                    self.last_check = current_time
+
+    async def wait_if_needed(self, api_key: str):
+        async with self.lock:
+            await self.check_api_status(api_key)
+            
+            current_time = time.time()
+            if current_time - self.last_reset >= self.interval:
+                self.requests_made = 0
+                self.last_reset = current_time
+
+            while self.requests_made >= self.requests_limit:
+                await asyncio.sleep(1)
+                current_time = time.time()
+                if current_time - self.last_reset >= self.interval:
+                    self.requests_made = 0
+                    self.last_reset = current_time
+
+            if self.requests_made >= self.requests_limit:
+                logging.info(f"Rate limit reached ({self.requests_made}/{self.requests_limit}), waiting...")
+
+            self.requests_made += 1
 
 class AICrawler:
     """
@@ -89,33 +161,53 @@ class AICrawler:
             ]
         )
         
+        self.openrouter_limiter = OpenRouterRateLimiter()
+        
     def _signal_handler(self, signum, frame):
         self._shutdown = True
         logging.info("Shutdown signal received, cleaning up...")
 
     async def analyze_with_ai(self, content: str, url: str) -> Tuple[str, List[str], float]:
-        """Enhanced AI analysis with relevance scoring"""
-        prompt = f"""
-        Topic: {self.topic}
-        URL: {url}
-        Content: {content[:1000]}...
+        """Enhanced AI analysis optimized for technical knowledge acquisition - using existing model"""
+        logging.info(f"Analyzing content from {url}")
         
-        Tasks:
-        1. Summarize the key points relevant to the topic
-        2. Rate relevance to topic (0-1)
-        3. Identify most promising links to follow
-        4. Extract key concepts/terms
-        
-        Format: JSON
-        """
+        if not content.strip():
+            logging.warning(f"Empty content received for {url}")
+            return ('', [], 0.0)
         
         try:
+            # Wait for rate limit if needed
+            await self.openrouter_limiter.wait_if_needed(self.config.openai_api_key)
+            
+            prompt = f"""
+            Analyze this technical content and create a concise but informative summary.
+
+            URL: {url}
+            Content: {content[:1000]}...
+            
+            Provide a structured analysis focusing on:
+            - What this page/document is about
+            - Key technical concepts or features
+            - Important implementation details
+            - How it relates to the larger system
+
+            Return as JSON:
+            {{
+                "summary": "Clear, technical summary of the content",
+                "relevant_links": ["important", "related", "links"],
+                "relevance_score": 0.0 to 1.0
+            }}
+
+            Keep the summary focused and technically precise.
+            """
+            
             headers = {
-                "Authorization": f"Bearer {openai.api_key}",
+                "Authorization": f"Bearer {self.config.openai_api_key}",
                 "HTTP-Referer": "https://crawlcombiner.local",
                 "X-Title": "CrawlCombiner"
             }
             
+            logging.info(f"Sending request to OpenAI for {url}")
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -125,19 +217,57 @@ class AICrawler:
                         "messages": [{"role": "user", "content": prompt}]
                     }
                 ) as response:
-                    result = await response.json()
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logging.error(f"API request failed with status {response.status}: {error_text}")
+                        return ('', [], 0.0)
                     
-            analysis = json.loads(result['choices'][0]['message']['content'])
-            return (
-                analysis.get('summary', ''),
-                analysis.get('relevant_links', []),
-                analysis.get('relevance_score', 0.0)
-            )
-        except json.JSONDecodeError:
-            logging.error(f"Failed to parse AI response for {url}")
-            return ('', [], 0.0)
+                    result = await response.json()
+                    logging.info(f"Received response from OpenAI for {url}")
+                    
+                    if 'choices' in result and result['choices']:
+                        content = result['choices'][0]['message']['content']
+                        logging.info(f"AI response content: {content}")
+                        
+                        try:
+                            # Try to find JSON block with or without markers
+                            json_text = None
+                            
+                            # First try with markers
+                            if '```json' in content:
+                                json_start = content.find('```json\n') + 8
+                                json_end = content.find('\n```', json_start)
+                                if json_start > 7 and json_end > json_start:
+                                    json_text = content[json_start:json_end].strip()
+                            
+                            # Then try finding bare JSON block
+                            if not json_text:
+                                start_idx = content.find('{')
+                                end_idx = content.rfind('}') + 1
+                                if start_idx != -1 and end_idx > start_idx:
+                                    json_text = content[start_idx:end_idx]
+                            
+                            if json_text:
+                                analysis = json.loads(json_text)
+                                return (
+                                    analysis.get('summary', ''),
+                                    analysis.get('relevant_links', []),
+                                    analysis.get('relevance_score', 0.0)
+                                )
+                            else:
+                                logging.error(f"No JSON block found in response for {url}")
+                                return ('', [], 0.0)
+                                
+                        except json.JSONDecodeError as e:
+                            logging.error(f"Failed to parse AI response for {url}: {e}")
+                            logging.error(f"Attempted to parse JSON: {json_text}")
+                            return ('', [], 0.0)
+                    else:
+                        logging.error(f"Invalid API response format: {result}")
+                        return ('', [], 0.0)
         except Exception as e:
             logging.error(f"AI analysis failed for {url}: {e}")
+            logging.error(f"Full error: {str(e)}")
             return ('', [], 0.0)
 
     async def can_fetch(self, url: str) -> bool:
@@ -238,22 +368,35 @@ class AICrawler:
         return True
 
     async def process_html(self, response) -> CrawlResult:
-        content = await response.text()
-        soup = BeautifulSoup(content, 'html.parser')
-        
-        # Remove script, style elements
-        for element in soup(['script', 'style', 'nav', 'footer']):
-            element.decompose()
-        
-        text = soup.get_text(separator=' ', strip=True)
-        summary, relevant_links, relevance = await self.analyze_with_ai(text, str(response.url))
-        
-        return CrawlResult(
-            url=str(response.url),
-            content_summary=summary,
-            relevant_links=[urljoin(str(response.url), link) for link in relevant_links],
-            metadata={"type": "html", "relevance": relevance}
-        )
+        try:
+            content = await response.text()
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Remove script, style elements
+            for element in soup(['script', 'style', 'nav', 'footer']):
+                element.decompose()
+            
+            text = soup.get_text(separator=' ', strip=True)
+            logging.info(f"Extracted text length: {len(text)} characters")
+            
+            if not text.strip():
+                logging.warning(f"No text content extracted from {response.url}")
+                return None
+            
+            summary, relevant_links, relevance = await self.analyze_with_ai(text, str(response.url))
+            
+            if not summary:
+                logging.warning(f"No summary generated for {response.url}")
+            
+            return CrawlResult(
+                url=str(response.url),
+                content_summary=summary,
+                relevant_links=[urljoin(str(response.url), link) for link in relevant_links],
+                metadata={"type": "html", "relevance": relevance}
+            )
+        except Exception as e:
+            logging.error(f"Error processing HTML for {response.url}: {e}")
+            raise
 
     async def process_json(self, response) -> CrawlResult:
         content = await response.json()
@@ -361,28 +504,6 @@ class ContentStore:
     async def close(self):
         pass  # No cleanup needed for file-based storage
 
-class CrawlerConfig(BaseSettings):
-    max_concurrent: int = 5
-    max_depth: int = 3
-    min_relevance_score: float = 0.5
-    requests_per_second: float = 2.0
-    openai_api_key: str
-    
-    class Config:
-        env_file = '.env'
-
-    @validator('requests_per_second')
-    def validate_rate_limit(cls, v):
-        if v <= 0 or v > 10:
-            raise ValueError('requests_per_second must be between 0 and 10')
-        return v
-
-    @validator('min_relevance_score')
-    def validate_relevance_score(cls, v):
-        if v < 0 or v > 1:
-            raise ValueError('min_relevance_score must be between 0 and 1')
-        return v
-
 class ContextManager:
     def __init__(self, initial_context: str):
         self.context = initial_context
@@ -404,7 +525,7 @@ class ContextManager:
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
                 json={
-                    "model": "anthropic/claude-2",
+                    "model": "openai/ -4-mini",
                     "messages": [{
                         "role": "user",
                         "content": f"""

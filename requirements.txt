@@ -1,7 +1,8 @@
 aiohttp
 beautifulsoup4
-openai
+openai>=1.1.1
 tenacity
 sentence-transformers
-pydantic
+pydantic>=2.10.1
+pydantic-settings>=2.6.1
 psutil

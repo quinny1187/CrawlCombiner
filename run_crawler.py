@@ -1,10 +1,20 @@
 import asyncio
+import logging
 from crawler import AICrawler
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('crawler.log'),
+        logging.StreamHandler()
+    ]
+)
+
 async def main():
-    # Example settings - modify these
-    initial_url = "https://openai.com/blog"  # Replace with your target website
-    topic = "your topic"                 # Replace with your topic of interest
+    initial_url = "https://github.com/modelcontextprotocol"
+    topic = "Put together everything I need to know about the model context protocol."
     
     async with AICrawler(initial_url, topic) as crawler:
         await crawler.run()
